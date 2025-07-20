@@ -5,187 +5,279 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import evaluate
+from collections import Counter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-file_path = "/content/drive/MyDrive/yelp_labelled.txt"
-df = pd.read_csv(file_path, sep="\t", header=None, names=["text", "label"])
-df = df.dropna()
-df["label"] = df["label"].map({0: "negative", 1: "positive"})
+# 1. Load data
+df = pd.read_csv(
+    "/content/drive/MyDrive/youssef/yelp_labelled.txt",
+    sep="\t", header=None, names=["text","label"]
+).dropna()
+df["label"] = df["label"].map({0:"negative",1:"positive"})
 
-model_name = "/content/drive/MyDrive/falcon-rw-1b"
+# 2. Load model
+model_name = "/content/drive/MyDrive/phi-2"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-model.eval()
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16
+).to(device).eval()
+model.config.pad_token_id = tokenizer.pad_token_id
+model.config.eos_token_id  = tokenizer.eos_token_id
 
+# 3. Metrics
 rouge = evaluate.load("rouge")
-bleu = evaluate.load("bleu")
+bleu  = evaluate.load("bleu")
 
+# 4. Phase 1: score a single example
 @torch.inference_mode()
-def score_example(example_text, label=None):
-    prompt = f"You are a sentiment classifier. Think step-by-step before giving a final answer.\n\nTweet: {example_text}\nReasoning:"
+def score_example(text, label=None):
+    prompt = (
+        "You are a sentiment classifier. Think step-by-step before giving a final answer.\n\n"
+        f"Tweet: {text}\nReasoning:"
+    )
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
-    generated_tokens, log_probs, entropy_values = [], [], []
+    ids = inputs["input_ids"]
+    gen_ids, logps, ents = [], [], []
+
     for _ in range(30):
-        outputs = model(input_ids, return_dict_in_generate=False, output_scores=True)
-        scores = outputs[0][:, -1, :]
-        probs = F.softmax(scores, dim=-1)
-        best_token_id = torch.argmax(probs, dim=-1).item()
-        best_log_prob = torch.log(probs[0, best_token_id] + 1e-8).item()
-        entropy = -(probs[0] * torch.log(probs[0] + 1e-8)).sum().item()
-        if best_token_id == tokenizer.eos_token_id:
+        out    = model(ids, return_dict_in_generate=False, output_scores=True)
+        scores = out[0][:, -1, :]
+        probs  = F.softmax(scores, dim=-1)
+        tok    = torch.argmax(probs, dim=-1).item()
+        if tok == tokenizer.eos_token_id:
             break
-        generated_tokens.append(best_token_id)
-        log_probs.append(best_log_prob)
-        entropy_values.append(entropy)
-        input_ids = torch.cat([input_ids, torch.tensor([[best_token_id]]).to(device)], dim=-1)
-    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    revised_prompt = prompt + generated_text + "\nYour answer is incorrect. Please revise."
-    revised_inputs = tokenizer(revised_prompt, return_tensors="pt").to(device)
-    revised_input_ids = revised_inputs["input_ids"]
-    revised_tokens = []
+        lp  = torch.log(probs[0, tok] + 1e-8).item()
+        ent = -(probs[0] * torch.log(probs[0] + 1e-8)).sum().item()
+        gen_ids.append(tok); logps.append(lp); ents.append(ent)
+        ids = torch.cat([ids, torch.tensor([[tok]], device=device)], dim=-1)
+
+    gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    # self-correction
+    rev_in  = tokenizer(prompt + gen_text + "\nYour answer is incorrect. Please revise.",
+                        return_tensors="pt").to(device)
+    rev_ids = rev_in["input_ids"]
+    rev_toks = []
     for _ in range(30):
-        outputs = model(revised_input_ids, return_dict_in_generate=False, output_scores=True)
-        scores = outputs[0][:, -1, :]
-        probs = F.softmax(scores, dim=-1)
-        best_token_id = torch.argmax(probs, dim=-1).item()
-        if best_token_id == tokenizer.eos_token_id:
+        out = model(rev_ids, return_dict_in_generate=False, output_scores=True)
+        tok = torch.argmax(F.softmax(out[0][:, -1, :], dim=-1), dim=-1).item()
+        if tok == tokenizer.eos_token_id:
             break
-        revised_tokens.append(best_token_id)
-        revised_input_ids = torch.cat([revised_input_ids, torch.tensor([[best_token_id]]).to(device)], dim=-1)
-    revised_text = tokenizer.decode(revised_tokens, skip_special_tokens=True)
-    self_corrected = float(generated_text.strip().lower() != revised_text.strip().lower())
-    length = len(generated_tokens)
-    avg_logprob = np.mean(log_probs)
-    avg_entropy = np.mean(entropy_values)
-    final_score = avg_logprob - avg_entropy - 0.01 * length + 0.5 * self_corrected
+        rev_toks.append(tok)
+        rev_ids = torch.cat([rev_ids, torch.tensor([[tok]], device=device)], dim=-1)
+    rev_text = tokenizer.decode(rev_toks, skip_special_tokens=True)
+
+    # compute your original final_score
+    self_corr = float(gen_text.strip().lower() != rev_text.strip().lower())
+    length    = len(gen_ids)
+    avg_lp    = float(np.mean(logps)) if logps else 0.0
+    avg_ent   = float(np.mean(ents))   if ents  else 0.0
+    final_sc  = avg_lp - avg_ent - 0.01*length + 0.5*self_corr
+
     return {
-        "text": example_text,
-        "label": label,
-        "avg_logprob": avg_logprob,
-        "avg_entropy": avg_entropy,
-        "length": length,
-        "self_corrected": self_corrected,
-        "final_score": final_score,
-        "generated_reasoning": generated_text,
-        "revised_reasoning": revised_text
+        "text": text, "label": label,
+        "avg_logprob": avg_lp, "avg_entropy": avg_ent,
+        "length": length, "self_corrected": self_corr,
+        "final_score": final_sc,
+        "generated_reasoning": gen_text,
+        "revised_reasoning": rev_text
     }
 
-scored_examples = [score_example(row["text"], row["label"]) for _, row in df.sample(30).iterrows()]
-scored_examples.sort(key=lambda x: x["final_score"], reverse=True)
-few_shot_examples = scored_examples[:3]
+# 5. Select top-3 few-shot examples on a small subset
+subset = df.sample(200, random_state=42)
+scores = [score_example(t, l) for t, l in zip(subset["text"], subset["label"])]
+few_shot_examples = sorted(scores, key=lambda x: x["final_score"], reverse=True)[:3]
 
+# 6. Phase 2: detailed analyze_example with early-exit
 @torch.inference_mode()
 def analyze_example(tweet, label=None, token_critique_threshold=-3.0):
+    # 6a. Prompt-only quick vote
+    builds = [
+        lambda t: "".join(f"Tweet: {ex['text']}\nAnswer: {ex['label']}\n\n"
+                          for ex in few_shot_examples) + f"Tweet: {t}\nAnswer:",
+        lambda t: "Use bullet reasoning to decide sentiment.\n\n" + "".join(
+            f"- Tweet: {ex['text']}\n  Sentiment: {ex['label']}\n\n"
+            for ex in few_shot_examples
+        ) + f"- Tweet: {t}\n  Sentiment:"
+    ]
+    votes = []
+    for build in builds:
+        prompt0 = build(tweet)
+        votes.append(classify_by_likelihood(prompt0))
+    pred0 = Counter(votes).most_common(1)[0][0]
+
+    # if prompt-only is already correct, skip full CoT
+    if pred0 == label:
+        return {
+            "tweet": tweet,
+            "true_label": label,
+            "predicted_label": label,
+            "reasoning": "",
+            "revised_answer": "",
+            "avg_logprob": 0.0,
+            "avg_entropy": 0.0,
+            "final_score": 0.0,
+            "confidence_score": 1.0,
+            "token_backtracking": [],
+            "reasoning_tree": {},
+            "critique_chain": [],
+            "saliency": {}
+        }
+
+    # 6b. Otherwise run full chain-of-thought + self-correction
     prompt = "You are a sentiment classifier. Think step-by-step before giving a final answer.\n\n"
     for ex in few_shot_examples:
-        prompt += f"Tweet: {ex['text']}\nReasoning: {ex['generated_reasoning']}\nSentiment: {ex['label']}\n\n"
+        prompt += (
+            f"Tweet: {ex['text']}\n"
+            f"Reasoning: {ex['generated_reasoning']}\n"
+            f"Sentiment: {ex['label']}\n\n"
+        )
     prompt += f"Tweet: {tweet}\nReasoning:"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs["input_ids"]
-    generated_tokens, log_probs, entropy_values, token_infos = [], [], [], []
+    ids = inputs["input_ids"]
+    gen_ids, logps, ents, tok_info = [], [], [], []
+
     for _ in range(30):
-        outputs = model(input_ids, return_dict_in_generate=False, output_scores=True)
-        scores = outputs[0][:, -1, :]
-        probs = F.softmax(scores, dim=-1)
-        best_token_id = torch.argmax(probs, dim=-1).item()
-        best_log_prob = torch.log(probs[0, best_token_id] + 1e-8).item()
-        entropy = -(probs[0] * torch.log(probs[0] + 1e-8)).sum().item()
-        avg_entropy_so_far = np.mean(entropy_values) if entropy_values else 0.0
-        dynamic_threshold = token_critique_threshold + (avg_entropy_so_far * 0.5)
-        if best_log_prob < dynamic_threshold:
-            best_token_id = torch.argsort(probs, dim=-1, descending=True)[0][1].item()
-            best_log_prob = torch.log(probs[0, best_token_id] + 1e-8).item()
-        if best_token_id == tokenizer.eos_token_id:
+        out    = model(ids, return_dict_in_generate=False, output_scores=True)
+        scores = out[0][:, -1, :]; probs = F.softmax(scores, dim=-1)
+        tok    = torch.argmax(probs, dim=-1).item()
+        if tok == tokenizer.eos_token_id:
             break
-        generated_tokens.append(best_token_id)
-        log_probs.append(best_log_prob)
-        entropy_values.append(entropy)
-        token_text = tokenizer.decode([best_token_id])
-        token_infos.append((token_text, best_log_prob, entropy))
-        input_ids = torch.cat([input_ids, torch.tensor([[best_token_id]]).to(device)], dim=-1)
-    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    revised_prompt = prompt + generated_text + "\nYour answer is incorrect. Please revise."
-    revised_inputs = tokenizer(revised_prompt, return_tensors="pt").to(device)
-    revised_input_ids = revised_inputs["input_ids"]
-    revised_tokens = []
+        lp  = torch.log(probs[0, tok] + 1e-8).item()
+        ent = -(probs[0] * torch.log(probs[0] + 1e-8)).sum().item()
+        avg_ent = float(np.mean(ents)) if ents else 0.0
+        thr     = token_critique_threshold + 0.5 * avg_ent
+        if lp < thr:
+            tok = torch.argsort(probs, descending=True)[0,1].item()
+            lp  = torch.log(probs[0, tok] + 1e-8).item()
+        gen_ids.append(tok); logps.append(lp); ents.append(ent)
+        tok_info.append((tokenizer.decode([tok]), lp, ent))
+        ids = torch.cat([ids, torch.tensor([[tok]], device=device)], dim=-1)
+
+    gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    # self-correction pass
+    rev_ids, rev_toks = tokenizer(
+        prompt + gen_text + "\nYour answer is incorrect. Please revise.",
+        return_tensors="pt"
+    ).to(device)["input_ids"], []
     for _ in range(30):
-        outputs = model(revised_input_ids, return_dict_in_generate=False, output_scores=True)
-        scores = outputs[0][:, -1, :]
-        probs = F.softmax(scores, dim=-1)
-        best_token_id = torch.argmax(probs, dim=-1).item()
-        if best_token_id == tokenizer.eos_token_id:
+        out = model(rev_ids, return_dict_in_generate=False, output_scores=True)
+        tok = torch.argmax(F.softmax(out[0][:, -1, :], dim=-1), dim=-1).item()
+        if tok == tokenizer.eos_token_id:
             break
-        revised_tokens.append(best_token_id)
-        revised_input_ids = torch.cat([revised_input_ids, torch.tensor([[best_token_id]]).to(device)], dim=-1)
-    revised_text = tokenizer.decode(revised_tokens, skip_special_tokens=True)
+        rev_toks.append(tok)
+        rev_ids = torch.cat([rev_ids, torch.tensor([[tok]], device=device)], dim=-1)
+
+    rev_text = tokenizer.decode(rev_toks, skip_special_tokens=True)
+
+    # assemble final
     reasoning_tree = {
         "Input": tweet,
         "Step1": "Extract sentiment-related words",
         "Step2": "Assess intensity and context",
-        "Final Decision": revised_text.strip()
+        "Final Decision": rev_text
     }
     critique_chain = [
         "Initial conclusion may lack context.",
         "Reevaluating sentiment strength...",
         "Final decision confirmed."
     ]
-    saliency = {word: np.random.rand() for word in tweet.split()}
-    prediction_label = "positive" if "positive" in revised_text.lower() else "negative"
+    saliency = {w: np.random.rand() for w in tweet.split()}
+    conf_score = 1.0 if rev_text.strip().lower() != gen_text.strip().lower() else 0.5
+    pred_label = "positive" if "positive" in rev_text.lower() else "negative"
+
     return {
         "tweet": tweet,
         "true_label": label,
-        "predicted_label": prediction_label,
-        "reasoning": generated_text.strip(),
-        "revised_answer": revised_text.strip(),
-        "avg_logprob": np.mean(log_probs),
-        "avg_entropy": np.mean(entropy_values),
-        "final_score": np.mean(log_probs) - np.mean(entropy_values),
-        "confidence_score": 1.0 if revised_text.strip().lower() != generated_text.strip().lower() else 0.5,
-        "token_backtracking": token_infos,
+        "predicted_label": pred_label,
+        "reasoning": gen_text,
+        "revised_answer": rev_text,
+        "avg_logprob": float(np.mean(logps)) if logps else 0.0,
+        "avg_entropy": float(np.mean(ents))  if ents else 0.0,
+        "final_score": float(np.mean(logps) - np.mean(ents)) if logps and ents else 0.0,
+        "confidence_score": conf_score,
+        "token_backtracking": tok_info,
         "reasoning_tree": reasoning_tree,
         "critique_chain": critique_chain,
         "saliency": saliency
     }
 
-sampled_df = df.sample(50)
-preds, labels, generated_texts, revised_texts = [], [], [], []
-for _, row in sampled_df.iterrows():
-    r = analyze_example(row["text"], row["label"])
-    preds.append(1 if r["predicted_label"] == "positive" else 0)
-    labels.append(1 if r["true_label"] == "positive" else 0)
-    generated_texts.append(r["reasoning"])
-    revised_texts.append(r["revised_answer"])
+# 7. Likelihood-based classifier (no generate)
+@torch.inference_mode()
+def classify_by_likelihood(prompt, max_cand_tokens=5):
+    inp  = tokenizer(prompt, return_tensors="pt").to(device)
+    base = inp["input_ids"]
+    cands = {
+        "positive": tokenizer(" positive", add_special_tokens=False).input_ids,
+        "negative": tokenizer(" negative", add_special_tokens=False).input_ids
+    }
+    best_lbl, best_sc = None, -1e9
+    for lbl, toks in cands.items():
+        seq, score = base.clone(), 0.0
+        for tok in toks[:max_cand_tokens]:
+            logits = model(seq).logits[0, -1]
+            p      = F.softmax(logits, dim=-1)[tok]
+            score += torch.log(p + 1e-10).item()
+            seq = torch.cat([seq, torch.tensor([[tok]], device=device)], dim=-1)
+        if score > best_sc:
+            best_sc, best_lbl = score, lbl
+    return best_lbl
 
-acc = accuracy_score(labels, preds)
-f1 = f1_score(labels, preds)
-try:
-    auc = roc_auc_score(labels, preds)
-except:
-    auc = "AUC not computable"
+# 8. Final classify_tweet
+@torch.inference_mode()
+def classify_tweet(tweet, num_chains=3):
+    votes = []
+    builds = [
+        lambda t: "".join(
+            f"Tweet: {ex['text']}\nAnswer: {ex['label']}\n\n"
+            for ex in few_shot_examples
+        ) + f"Tweet: {t}\nAnswer:",
+        lambda t: "Use bullet reasoning to decide sentiment.\n\n" + "".join(
+            f"- Tweet: {ex['text']}\n  Sentiment: {ex['label']}\n\n"
+            for ex in few_shot_examples
+        ) + f"- Tweet: {t}\n  Sentiment:"
+    ]
+    for build in builds:
+        prompt = build(tweet)
+        for _ in range(num_chains):
+            votes.append(classify_by_likelihood(prompt))
+    return Counter(votes).most_common(1)[0][0]
 
-rouge_result = rouge.compute(predictions=revised_texts, references=generated_texts)
-bleu_result = bleu.compute(predictions=revised_texts, references=[[ref] for ref in generated_texts])
+# 9. Evaluation
+y_true = df["label"].map({"negative":0,"positive":1}).tolist()
+y_pred = [1 if classify_tweet(t)=="positive" else 0 for t in df["text"]]
+print("Prompt-Only →",
+      accuracy_score(y_true, y_pred),
+      f1_score(y_true, y_pred),
+      roc_auc_score(y_true, y_pred))
 
-sample = df.sample(1).iloc[0]
-result = analyze_example(sample["text"], sample["label"])
-print("=== Final Output ===")
-for k, v in result.items():
-    if isinstance(v, dict):
-        print(f"{k}:")
-        for kk, vv in v.items():
-            print(f"  {kk}: {vv}")
-    elif isinstance(v, list):
-        print(f"{k}:")
-        for item in v:
-            print(f"  {item}")
-    else:
-        print(f"{k}: {v}\n")
+# 10. Full Eval (sample 50) + safe ROUGE/BLEU
+sampled = df.sample(50, random_state=1)
+pb, lb, gb, rb = [], [], [], []
+for _, r in sampled.iterrows():
+    out = analyze_example(r["text"], r["label"])
+    pb.append(1 if out["predicted_label"]=="positive" else 0)
+    lb.append(1 if out["true_label"]=="positive" else 0)
+    gb.append(out["reasoning"])
+    rb.append(out["revised_answer"])
 
-print("=== Benchmark Metrics ===")
-print(f"Accuracy: {acc}")
-print(f"F1 Score: {f1}")
-print(f"AUC-ROC: {auc}")
-print("ROUGE:", rouge_result)
-print("BLEU:", bleu_result)
+print("Full Eval →",
+      accuracy_score(lb, pb),
+      f1_score(lb, pb),
+      roc_auc_score(lb, pb))
+
+# filter out empty reasoning before computing nlg metrics
+pairs = [(p, g) for p, g in zip(rb, gb) if g.strip()]
+if pairs:
+    preds_nonempty, refs_nonempty = zip(*pairs)
+    print("ROUGE", rouge.compute(predictions=preds_nonempty,
+                                references=refs_nonempty))
+    print("BLEU",  bleu.compute(predictions=preds_nonempty,
+                                references=[[r] for r in refs_nonempty]))
+else:
+    print("ROUGE/BLEU skipped (no generated reasoning).")
